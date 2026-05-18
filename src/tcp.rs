@@ -331,6 +331,70 @@ impl TcpListenerRunner {
                         waker.wake();
                     }
                 }
+
+                // Aggressive recycling for tight-memory embedders
+                // (iOS NE, ~50 MB jetsam cap). The default smoltcp TCP
+                // state machine holds:
+                //
+                //   * TIME_WAIT for 2*MSL after our FIN+ACK completes,
+                //     so stale segments from the old 4-tuple can't
+                //     poison a fresh one. On a logical TUN device,
+                //     those segments cannot physically arrive — there
+                //     is no open network in front of us — so the wait
+                //     is pure dead weight.
+                //
+                //   * CLOSE_WAIT after the peer (the iOS app in our
+                //     case) sends FIN, until our side sends its own
+                //     FIN. With our dispatch task's local-EOF watcher
+                //     that should happen within ~250 ms, but if the
+                //     proxy outbound is wedged the socket can linger
+                //     in CLOSE_WAIT indefinitely.
+                //
+                // Once our `TcpStream` Drop has fired (visible here as
+                // `send_state` no longer being `Normal`), we no longer
+                // care about a clean four-way close — the task is gone
+                // and the upper-layer relay has already shut down its
+                // outbound. Force `socket.abort()` to RST and recycle
+                // the smoltcp socket on the next poll iteration.
+                let aggressive_recycle = match socket.state() {
+                    // TIME_WAIT after we initiated close is the most
+                    // common case for short-lived flows.
+                    TcpState::TimeWait => true,
+                    // App closed but the dispatch task has dropped
+                    // the stream too; nothing else will progress the
+                    // close.  Also covers wedged proxy-outbound cases.
+                    TcpState::CloseWait => !matches!(
+                        control.send_state,
+                        TcpSocketState::Normal
+                    ),
+                    // Symmetric with CloseWait: we sent FIN, peer
+                    // ACK'd, peer hasn't FIN'd back. Once our stream
+                    // is dropped the relay is gone and we have no
+                    // reason to keep listening.
+                    TcpState::FinWait2 => matches!(
+                        control.recv_state,
+                        TcpSocketState::Closed | TcpSocketState::Closing
+                    ),
+                    _ => false,
+                };
+                if aggressive_recycle {
+                    trace!(
+                        "aggressive abort: state={:?} send={:?} recv={:?}",
+                        socket.state(),
+                        control.send_state,
+                        control.recv_state
+                    );
+                    socket.abort();
+                    // Surface as Closed to both halves so any
+                    // last-second poll_read/poll_write returns
+                    // immediately rather than spinning.
+                    if !matches!(control.send_state, TcpSocketState::Closed) {
+                        control.send_state = TcpSocketState::Closed;
+                    }
+                    if !matches!(control.recv_state, TcpSocketState::Closed) {
+                        control.recv_state = TcpSocketState::Closed;
+                    }
+                }
             }
 
             for socket_handle in sockets_to_remove {
