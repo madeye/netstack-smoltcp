@@ -63,7 +63,16 @@ impl Device for VirtualDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut capabilities = DeviceCapabilities::default();
         capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = 1504;
+        // 1500, not the upstream's 1504. Upstream's "1500 + 4 for VLAN"
+        // allowance is wrong for a raw-IP TUN — there is no VLAN tag
+        // between iOS NEPacketTunnelFlow and this stack. With 1504 here
+        // smoltcp advertises MSS=1464, while the iOS app's TCP stack
+        // (deriving MSS from the TUN MTU=1500) advertises MSS=1460.
+        // Wire segments still stay ≤1500 because both ends pick
+        // `min(peer_mss, local_mss)`, but the asymmetry papers over
+        // sloppy book-keeping and any iOS path that compared raw MTU
+        // (not MSS) would silently drop egress.
+        capabilities.max_transmission_unit = 1500;
         capabilities
     }
 }
